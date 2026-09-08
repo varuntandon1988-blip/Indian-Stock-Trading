@@ -1,0 +1,22 @@
+# NSE Intraday System — paper-trading schedule (NO ORDERS).
+# Install:  crontab -e   then paste these lines (edit the path + env).
+# Times below are written for a server whose clock is IST. If your server is
+# UTC, either set  CRON_TZ=Asia/Kolkata  (supported by most cron daemons) or
+# subtract 5h30m from each time.
+
+CRON_TZ=Asia/Kolkata
+GROWW_ACCESS_TOKEN=replace_me_or_set_in_a_sourced_env_file
+TICKERS=INFY,HDFCBANK,ICICIBANK
+MIN_SCORE=60
+COMMIT=1
+
+# --- scans during the session (primary + secondary windows) ---
+30 10 * * 1-5  cd /path/to/repo/.claude/skills/nse-intraday-system/scripts/live && ./run_paper.sh scan   >> paper.out 2>&1
+30 11 * * 1-5  cd /path/to/repo/.claude/skills/nse-intraday-system/scripts/live && ./run_paper.sh scan   >> paper.out 2>&1
+0  14 * * 1-5  cd /path/to/repo/.claude/skills/nse-intraday-system/scripts/live && ./run_paper.sh scan   >> paper.out 2>&1
+
+# --- reconcile after the close ---
+0  16 * * 1-5  cd /path/to/repo/.claude/skills/nse-intraday-system/scripts/live && ./run_paper.sh reconcile >> paper.out 2>&1
+
+# NSE trading holidays are not skipped by cron; on a holiday the fetch simply
+# returns no fresh session and the run is a harmless no-op.
