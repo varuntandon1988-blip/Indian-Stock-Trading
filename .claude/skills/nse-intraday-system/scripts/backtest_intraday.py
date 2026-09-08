@@ -65,6 +65,10 @@ class Params:
     max_position_pct: float | None = 0.40
     setup: str = "both"          # "orb", "vwap", or "both"
     impulse_pct: float = 0.004   # VWAP setup: min impulse move from open (0.4%)
+    # Portfolio selection (backtest_portfolio only):
+    min_score: float = 0.0       # five-factor score gate (0 = take every signal)
+    max_trades_day: int = 5      # cap across the whole universe per day
+    daily_loss_cap_pct: float = 0.015   # stop taking new trades past -1.5%/day
 
 
 # --------------------------------------------------------------------------
@@ -133,18 +137,52 @@ def _simulate_long(bars, entry, stop, target, p, cost: IntradayCostModel):
     }
 
 
-def _regime_rs_ok(ndf, nifty_open, stock_open, bar):
-    """Bullish NIFTY regime and positive relative strength at this bar."""
+def _regime_rs(ndf, nifty_open, stock_open, bar):
+    """Return (nifty_ret, stock_ret) since the open at this bar, or None."""
     n_here = ndf[ndf.index <= bar.name]
     if n_here.empty:
-        return False
+        return None
     nifty_ret = n_here.iloc[-1]["Close"] / nifty_open - 1
     stock_ret = bar["Close"] / stock_open - 1
-    return nifty_ret > 0 and stock_ret > nifty_ret
+    return nifty_ret, stock_ret
 
 
-def run_day_orb(sdf, ndf, p, cost: IntradayCostModel):
-    """Opening Range Breakout for one stock-day. Returns a trade dict or None."""
+def _clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _score_long(nifty_ret, rs_spread, vol_ratio, structure_pts):
+    """Five-factor composite (0-100) for a long, from data available in the
+    backtest. Catalyst is 0 here (no news feed), so the ceiling is ~85 — the
+    same ceiling the skill documents for a purely technical setup.
+
+    - Regime (0-20): NIFTY up since open; full at +0.5%.
+    - Relative strength (0-25): stock minus NIFTY return; full at +1.0% spread.
+    - Volume (0-20): trigger-bar volume vs the day's average so far; 0 at 1x,
+      full at >=2x.
+    - Structure (0-20): setup-specific cleanliness, passed in.
+    """
+    regime = _clip(nifty_ret / 0.005, 0, 1) * 20
+    rs = _clip(rs_spread / 0.01, 0, 1) * 25
+    vol = _clip((vol_ratio - 1.0) / 1.0, 0, 1) * 20
+    structure = _clip(structure_pts, 0, 20)
+    return round(regime + rs + vol + structure, 1)
+
+
+@dataclass
+class Candidate:
+    setup: str
+    date: str
+    trigger_ts: object
+    trigger_time: str
+    entry: float
+    stop: float
+    target: float
+    score: float
+
+
+def detect_orb(sdf, ndf, p, cost=None):
+    """Detect an ORB long for one stock-day. Returns a scored Candidate or None."""
     or_bars = sdf[(sdf["t"] >= p.or_start) & (sdf["t"] < p.or_end)]
     if len(or_bars) < p.min_or_bars:
         return None
@@ -163,14 +201,13 @@ def run_day_orb(sdf, ndf, p, cost: IntradayCostModel):
         avg_vol = prior["Volume"].mean()
         if avg_vol <= 0:
             continue
-        # Long breakout conditions.
         if not (bar["Close"] > or_high
                 and bar["Close"] > bar["vwap"]
                 and bar["Volume"] > p.vol_mult * avg_vol):
             continue
-        if not _regime_rs_ok(ndf, nifty_open, stock_open, bar):
+        rr = _regime_rs(ndf, nifty_open, stock_open, bar)
+        if rr is None or not (rr[0] > 0 and rr[1] > rr[0]):
             continue
-        # Fill on the NEXT bar's open (no look-ahead).
         after = sdf[sdf.index > ts]
         if after.empty:
             break
@@ -178,23 +215,19 @@ def run_day_orb(sdf, ndf, p, cost: IntradayCostModel):
         stop = or_low
         if entry - stop <= 0:
             break
-        target = entry + p.rr * (entry - stop)
-        trade = _simulate_long(after, entry, stop, target, p, cost)
-        if trade:
-            trade["setup"] = "orb"
-            trade["date"] = str(bar["date"])
-            trade["trigger_time"] = str(bar["t"])
-        return trade
+        structure = 12 + _clip((bar["Close"] / bar["vwap"] - 1) / 0.005, 0, 1) * 8
+        score = _score_long(rr[0], rr[1] - rr[0], bar["Volume"] / avg_vol, structure)
+        return Candidate("orb", str(bar["date"]), ts, str(bar["t"]),
+                         entry, stop, entry + p.rr * (entry - stop), score)
     return None
 
 
-def run_day_vwap(sdf, ndf, p, cost: IntradayCostModel):
-    """VWAP continuation for one stock-day. Returns a trade dict or None.
+def detect_vwap(sdf, ndf, p, cost=None):
+    """Detect a VWAP-continuation long for one stock-day. Scored Candidate/None.
 
-    State machine over the primary window: impulse above VWAP -> pullback toward
-    VWAP on contracting volume (holding above VWAP) -> resumption above the
-    pullback high on a volume expansion. Entry fills on the next bar's open;
-    the structural stop is the pullback low. Losing VWAP invalidates the setup.
+    State machine: impulse above VWAP -> pullback toward VWAP on contracting
+    volume (holding above VWAP) -> resumption above the pullback high on a
+    volume expansion. Structural stop = pullback low; losing VWAP invalidates.
     """
     stock_open = sdf.iloc[0]["Open"]
     if ndf is None or ndf.empty:
@@ -219,30 +252,30 @@ def run_day_vwap(sdf, ndf, p, cost: IntradayCostModel):
                     and (bar["Close"] / stock_open - 1) >= p.impulse_pct):
                 impulse_high = bar["High"]
                 impulse_vol = bar["Volume"]
-                pullback_low = None                    # set from pullback bars
+                pullback_low = None
                 phase = "seek_pullback"
             continue
 
         if phase == "seek_pullback":
-            if bar["Low"] < vwap:                      # lost VWAP -> invalid
+            if bar["Low"] < vwap:
                 phase = "seek_impulse"
                 continue
             pullback_low = (bar["Low"] if pullback_low is None
                             else min(pullback_low, bar["Low"]))
-            # Contraction: eased off the impulse high on lighter volume.
             if bar["Volume"] < impulse_vol and bar["Close"] < impulse_high:
                 resume_ref = bar["High"]
                 phase = "seek_resume"
             continue
 
         if phase == "seek_resume":
-            if bar["Low"] < vwap:                      # lost VWAP -> restart
+            if bar["Low"] < vwap:
                 phase = "seek_impulse"
                 continue
             pullback_low = min(pullback_low, bar["Low"])
             resumed = (bar["Close"] > resume_ref and bar["Close"] > vwap
                        and bar["Volume"] > p.vol_mult * avg_vol)
-            if resumed and _regime_rs_ok(ndf, nifty_open, stock_open, bar):
+            rr = _regime_rs(ndf, nifty_open, stock_open, bar)
+            if resumed and rr is not None and rr[0] > 0 and rr[1] > rr[0]:
                 after = sdf[sdf.index > ts]
                 if after.empty:
                     break
@@ -250,42 +283,109 @@ def run_day_vwap(sdf, ndf, p, cost: IntradayCostModel):
                 stop = pullback_low
                 if entry - stop <= 0:
                     break
-                target = entry + p.rr * (entry - stop)
-                trade = _simulate_long(after, entry, stop, target, p, cost)
-                if trade:
-                    trade["setup"] = "vwap"
-                    trade["date"] = str(bar["date"])
-                    trade["trigger_time"] = str(bar["t"])
-                return trade
+                structure = 14 + _clip((bar["Close"] / resume_ref - 1) / 0.003, 0, 1) * 6
+                score = _score_long(rr[0], rr[1] - rr[0],
+                                    bar["Volume"] / avg_vol, structure)
+                return Candidate("vwap", str(bar["date"]), ts, str(bar["t"]),
+                                 entry, stop, entry + p.rr * (entry - stop), score)
     return None
 
 
-def run_day(sdf, ndf, p, cost: IntradayCostModel):
-    """Dispatch to the configured setup(s). In 'both' mode, take the earliest
-    trigger of the day (one trade per stock per day)."""
-    if p.setup == "orb":
-        return run_day_orb(sdf, ndf, p, cost)
-    if p.setup == "vwap":
-        return run_day_vwap(sdf, ndf, p, cost)
-    # both -> earliest trigger wins
-    candidates = [t for t in (run_day_orb(sdf, ndf, p, cost),
-                              run_day_vwap(sdf, ndf, p, cost)) if t]
-    if not candidates:
+def simulate_candidate(sdf, cand: Candidate, p, cost: IntradayCostModel):
+    """Simulate a detected candidate; returns a trade dict (or None)."""
+    after = sdf[sdf.index > cand.trigger_ts]
+    if after.empty:
         return None
-    return min(candidates, key=lambda t: t["trigger_time"])
+    trade = _simulate_long(after, cand.entry, cand.stop, cand.target, p, cost)
+    if trade:
+        trade["setup"] = cand.setup
+        trade["date"] = cand.date
+        trade["trigger_time"] = cand.trigger_time
+        trade["score"] = cand.score
+    return trade
+
+
+def _detectors(setup):
+    return {"orb": [detect_orb], "vwap": [detect_vwap],
+            "both": [detect_orb, detect_vwap]}[setup]
+
+
+def _day_candidate(sdf, ndf, p, cost):
+    """Best candidate for one stock-day (highest score; earliest breaks ties)."""
+    cands = [c for det in _detectors(p.setup)
+             if (c := det(sdf, ndf, p, cost)) is not None]
+    if not cands:
+        return None
+    return max(cands, key=lambda c: (c.score, -_hhmmss(c.trigger_time)))
+
+
+def _hhmmss(t):
+    h, m, s = (int(x) for x in t.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def run_day(sdf, ndf, p, cost: IntradayCostModel):
+    """One trade per stock-day. In 'both' mode the higher-scoring setup wins
+    (earliest trigger breaks ties)."""
+    cand = _day_candidate(sdf, ndf, p, cost)
+    return simulate_candidate(sdf, cand, p, cost) if cand else None
 
 
 def backtest(stock_df, nifty_df, p: Params, cost: IntradayCostModel | None = None):
+    """Single-stock backtest (no universe ranking, no daily cap)."""
     cost = cost or IntradayCostModel()
     s = prepare(stock_df)
     n = prepare(nifty_df)
     trades = []
     for d in sorted(set(s["date"])):
-        sdf = s[s["date"] == d]
-        ndf = n[n["date"] == d]
-        t = run_day(sdf, ndf, p, cost)
+        t = run_day(s[s["date"] == d], n[n["date"] == d], p, cost)
         if t:
             trades.append(t)
+    return trades
+
+
+def backtest_portfolio(stock_dfs: dict, nifty_df, p: Params,
+                       cost: IntradayCostModel | None = None):
+    """Universe backtest with score-ranked selection and daily controls.
+
+    Each day: collect the best candidate per stock, drop those below
+    `min_score`, rank the survivors by score (earliest trigger breaks ties),
+    then take up to `max_trades_day`, stopping once the day's realized net P&L
+    breaches `-daily_loss_cap_pct` of capital. Trades are sized at constant
+    risk against full capital (still leverage-naive for concurrent positions —
+    the R-expectancy is the sizing-independent metric)."""
+    cost = cost or IntradayCostModel()
+    prepared = {tk: prepare(df) for tk, df in stock_dfs.items()}
+    n = prepare(nifty_df)
+    all_dates = sorted({d for s in prepared.values() for d in set(s["date"])})
+
+    trades = []
+    for d in all_dates:
+        ndf = n[n["date"] == d]
+        if ndf.empty:
+            continue
+        day_cands = []
+        for tk, s in prepared.items():
+            sdf = s[s["date"] == d]
+            if sdf.empty:
+                continue
+            c = _day_candidate(sdf, ndf, p, cost)
+            if c and c.score >= p.min_score:
+                day_cands.append((tk, sdf, c))
+        day_cands.sort(key=lambda x: (-x[2].score, _hhmmss(x[2].trigger_time)))
+
+        day_pnl, taken = 0.0, 0
+        loss_cap = -p.capital * p.daily_loss_cap_pct
+        for tk, sdf, c in day_cands:
+            if taken >= p.max_trades_day or day_pnl <= loss_cap:
+                break
+            tr = simulate_candidate(sdf, c, p, cost)
+            if not tr:
+                continue
+            tr["ticker"] = tk
+            trades.append(tr)
+            day_pnl += tr["net_pnl"]
+            taken += 1
     return trades
 
 
@@ -425,6 +525,7 @@ def _selftest():
     assert len(trades) == 2, f"expected 2 trades, got {len(trades)}: {trades}"
     t1, t2 = trades
     assert t1["setup"] == "orb" and t2["setup"] == "orb"
+    assert "score" in t1 and 0 < t1["score"] <= 100, t1
     assert t1["reason"] == "target", t1
     assert t2["reason"] == "stop", t2
     # Costs must make net worse than gross on both.
@@ -477,10 +578,24 @@ def _selftest():
     ])
     assert backtest(inval, vnifty, Params(setup="vwap"), cost) == [], "should be no VWAP trade"
 
-    # --- both mode: earliest trigger of the day wins (ORB 09:30 < VWAP 09:45) ---
+    # --- scoring: bounds and monotonicity ---
+    assert _score_long(0.005, 0.01, 2.0, 20) == 85.0        # full technical ceiling
+    assert _score_long(0.0, 0.0, 1.0, 0.0) == 0.0
+    assert (_score_long(0.005, 0.01, 2.0, 20)
+            > _score_long(0.001, 0.002, 1.2, 12))           # stronger reads score higher
+
+    # --- both mode: higher-scoring setup wins (one trade/stock/day) ---
     both = backtest(vday, vnifty, Params(setup="both"), cost)
-    assert len(both) == 1 and both[0]["setup"] == "orb", both
-    assert both[0]["trigger_time"] == "09:30:00", both[0]
+    assert len(both) == 1 and both[0]["setup"] in ("orb", "vwap"), both
+    assert "score" in both[0], both[0]
+
+    # --- portfolio: score gate filters, and a listed ticker is tagged ---
+    pf = backtest_portfolio({"AAA": vday}, vnifty,
+                            Params(setup="vwap", min_score=0.0), cost)
+    assert len(pf) == 1 and pf[0]["ticker"] == "AAA", pf
+    high_gate = backtest_portfolio({"AAA": vday}, vnifty,
+                                   Params(setup="vwap", min_score=99.0), cost)
+    assert high_gate == [], "score gate 99 should reject the candidate"
 
     print("backtest self-tests passed.")
     return trades, m
@@ -491,12 +606,17 @@ def _selftest():
 # --------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="NSE intraday ORB backtest (cost-aware)")
+    ap = argparse.ArgumentParser(description="NSE intraday backtest (ORB + VWAP, cost-aware)")
     ap.add_argument("--tickers", help="comma-separated, e.g. RELIANCE,TCS,INFY")
     ap.add_argument("--source", choices=["yfinance", "csv"], default="yfinance")
     ap.add_argument("--csv-dir", default=".")
     ap.add_argument("--period", default="60d", help="yfinance period (max ~60d for 5m)")
     ap.add_argument("--setup", choices=["orb", "vwap", "both"], default="both")
+    ap.add_argument("--rank", action="store_true",
+                    help="score-ranked portfolio selection with daily controls")
+    ap.add_argument("--min-score", type=float, default=0.0,
+                    help="five-factor score gate (with --rank; e.g. 60)")
+    ap.add_argument("--max-trades-day", type=int, default=5)
     ap.add_argument("--capital", type=float, default=1_000_000.0)
     ap.add_argument("--risk", type=float, default=0.005)
     ap.add_argument("--index-symbol", default="^NSEI", help="regime/RS index (Yahoo: ^NSEI)")
@@ -508,7 +628,8 @@ def main():
         print("Provide --tickers to run on real 5-minute data.")
         return
 
-    p = Params(capital=args.capital, risk_pct=args.risk, setup=args.setup)
+    p = Params(capital=args.capital, risk_pct=args.risk, setup=args.setup,
+               min_score=args.min_score, max_trades_day=args.max_trades_day)
     cost = IntradayCostModel()
 
     if args.source == "yfinance":
@@ -518,19 +639,28 @@ def main():
         nifty = load_5m_csv(os.path.join(args.csv_dir, "NIFTY.csv"))
         load = lambda tk: load_5m_csv(os.path.join(args.csv_dir, f"{tk}.csv"))
 
-    all_trades = []
-    for tk in [t.strip() for t in args.tickers.split(",") if t.strip()]:
+    tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+    dfs = {}
+    for tk in tickers:
         try:
-            trades = backtest(load(tk), nifty, p, cost)
+            dfs[tk] = load(tk)
         except Exception as e:  # noqa: BLE001
             print(f"[{tk}] skipped: {e}")
-            continue
-        for t in trades:
-            t["ticker"] = tk
-        all_trades.extend(trades)
-        print(f"[{tk}] {len(trades)} trade(s)")
 
-    print(f"\n=== Aggregate (NET of costs) — setup: {args.setup} ===")
+    if args.rank:
+        all_trades = backtest_portfolio(dfs, nifty, p, cost)
+        mode = f"portfolio ranked, min_score={args.min_score}, cap={args.max_trades_day}/day"
+    else:
+        all_trades = []
+        for tk, df in dfs.items():
+            trades = backtest(df, nifty, p, cost)
+            for t in trades:
+                t["ticker"] = tk
+            all_trades.extend(trades)
+            print(f"[{tk}] {len(trades)} trade(s)")
+        mode = "per-stock (no ranking)"
+
+    print(f"\n=== Aggregate (NET of costs) — setup: {args.setup} | {mode} ===")
     m = metrics(all_trades, args.capital)
     for k, v in m.items():
         print(f"  {k:20s}: {v}")
@@ -539,9 +669,9 @@ def main():
         for t in all_trades:
             by_setup[t.get("setup", "?")] = by_setup.get(t.get("setup", "?"), 0) + 1
         print(f"  {'trades_by_setup':20s}: {by_setup}")
-    print("\nReminder: a ~60-day, single-setup backtest on today's tickers is a "
-          "smoke test, not validation. Use the backtest-expert skill for the "
-          "real thing (walk-forward, out-of-sample, robustness, survivorship).")
+    print("\nReminder: even a multi-year run on a handful of tickers is a smoke "
+          "test, not validation. Use the backtest-expert skill for the real "
+          "thing (walk-forward, out-of-sample, robustness, survivorship).")
 
 
 if __name__ == "__main__":
