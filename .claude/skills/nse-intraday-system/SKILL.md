@@ -177,8 +177,13 @@ python3 scripts/backtest_intraday.py --setup vwap --tickers RELIANCE   # VWAP on
 python3 scripts/backtest_intraday.py --source csv --csv-dir ./data --tickers RELIANCE
 ```
 
-- `--setup orb | vwap | both` (default `both` — one trade/stock/day, earliest
-  trigger wins).
+- `--setup orb | vwap | both` (default `both` — one trade/stock/day, the
+  higher five-factor **score** wins; earliest trigger breaks ties).
+- `--rank --min-score 60 --max-trades-day 5` → portfolio mode: each day ranks
+  candidates across the universe by score, applies the gate, caps trades/day,
+  and stops on a −1.5%/day loss. On real data the score is a strong risk filter
+  (raising the gate cut loss and drawdown ~4×) but did not by itself turn the
+  edge positive — see `references/example_backtest_run.md`.
 - **ORB:** breakout of the 09:15–09:30 range; structural stop = opening-range low.
 - **VWAP continuation:** impulse above VWAP → pullback toward VWAP on contracting
   volume (holding above it) → resumption on a volume expansion; structural stop =

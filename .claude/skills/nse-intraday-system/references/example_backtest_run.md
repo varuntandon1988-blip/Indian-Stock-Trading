@@ -70,10 +70,45 @@ Exit-reason breakdown (the important part):
 - **Survivorship / point-in-time.** Today's liquid names, back-projected.
 - **One setup variant, fixed parameters.** No walk-forward, no robustness sweep.
 
+## Follow-up: does the five-factor score help? (score-gate sweep)
+
+Re-ran the same data with `backtest_portfolio` (`--rank`), sweeping the
+`min_score` gate. In-backtest scores span 31–85 (median 61; catalyst is 0 with
+no news feed, so ~85 is the ceiling).
+
+| Gate | Trades | Win% | Exp/trade | PF | Net% | MaxDD% |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 453 | 38.9 | −0.170R | 0.64 | −26.7 | 27.2 |
+| 50 | 359 | 40.4 | −0.121R | 0.69 | −18.2 | 18.2 |
+| 55 | 308 | 41.6 | −0.107R | 0.72 | −14.0 | 14.9 |
+| 60 | 243 | 43.2 | −0.073R | 0.79 | −8.0 | 9.7 |
+| 65 | 165 | 41.8 | −0.072R | 0.80 | −5.2 | 7.2 |
+| 70 | 99 | 36.4 | −0.147R | 0.70 | −5.1 | 5.6 |
+| 75 | 64 | 35.9 | −0.086R | 0.83 | −1.8 | 2.3 |
+
+**Findings:**
+1. **The score has genuine signal, up to ~gate 65.** Expectancy, win rate and
+   profit factor all improve monotonically as the gate rises, and the loss and
+   drawdown shrink 4× (−27%→−5%, DD 27%→7%). Higher-scored trades are really
+   better — even scored from OHLCV alone (no catalyst, sector, breadth or VIX).
+2. **It never turns positive.** Every gate still loses (PF < 1.0). The score is
+   a good *risk filter*, not an *alpha generator*: it cuts the bleed, it does
+   not create an edge that the setups lack.
+3. **The top decile is noisy** — gate 70 reverses (−0.147R). The highest-scoring
+   days are often gap / volatility extremes that mean-revert intraday, and the
+   sample is small (64–99 trades over 4 years). Don't over-trust the extreme.
+
+Reproduce: `backtest_intraday.py --source csv --csv-dir <dir> --tickers
+INFY,HDFCBANK,ICICIBANK --rank --min-score 60`.
+
 ## The takeaway
 
 The harness works and tells the truth: a naive intraday ORB/VWAP system on
 large-caps is gross-flat and **loses after costs** — the default outcome SEBI's
-loss statistics would predict. Turning this into something with a real edge is
-the job of the `backtest-expert` workflow (walk-forward, out-of-sample,
-robustness, a proper universe), not of a bigger backtest of the same idea.
+loss statistics would predict. Score-ranked selection *helps* (it quarters the
+loss and the drawdown) but does not reach profitability, which localises the
+problem: the **selection layer is fine; the entries/exits are not** — in
+particular the fixed 2R target that fills only 7% of the time. Turning this into
+a real edge is the job of the `backtest-expert` workflow (walk-forward,
+out-of-sample, robustness, a proper universe) applied to the *exit logic*, not
+a bigger backtest of the same idea.
