@@ -87,9 +87,11 @@ Use whichever broker MCP is connected (same tools as `india-stock-analysis`):
 
 > **Data caveat for backtesting.** Free sources (yfinance) provide only ~60
 > days of 5-minute history and are survivorship-biased to today's universe.
-> Honest multi-year (2021–2026) intraday validation of this system needs a
-> **paid/archived 5-minute dataset with a point-in-time universe**. Say this
-> explicitly rather than pretending a free-data backtest is conclusive.
+> That is enough for a **cost-aware smoke test** (see Backtesting below), but
+> **not** for validation. Honest multi-year (2021–2026) intraday validation
+> needs a **paid/archived 5-minute dataset with a point-in-time universe** —
+> the backtest harness reads a CSV so you can feed it exactly that when you
+> have it. Never present a 60-day, single-setup result as conclusive.
 
 ## The five-factor score (0–100)
 
@@ -138,16 +140,50 @@ and `daily_risk_check` (−1.5% daily stop + max-trade count). Rules, the
 stop-loss model, and the **cost math that decides viability** are in
 `references/risk_and_costs.md`.
 
-## Honest expectancy note (do not skip)
+## Honest expectancy note (do not skip) — now enforced in code
 
-The plan's own illustrative expectancy — win rate 50%, avg winner 1.25R, avg
-loser 1R → **+0.125R ≈ +0.0625% gross per trade** — is *smaller than realistic
-Indian intraday round-trip cost + slippage* (~0.08–0.15% of turnover). Taken
-literally, that illustration is a **losing system after costs.** The viable
-bar is the Section-12 target profile: **avg winner / avg loser > 2, profit
-factor > 1.4, expectancy positive out-of-sample after costs.** Always evaluate
-on expectancy net of costs — never on win rate alone, and never on a
-pre-cost number.
+The plan's illustrative expectancy — win 50%, avg winner 1.25R, avg loser 1R →
+**+0.125R gross per trade** — is thin enough that transaction costs decide
+whether it lives or dies. `scripts/cost_model.py` computes this exactly:
+
+| Stop width | Cost drag | Illustration (50%/1.25R/1R) net | Section-12 target (45%/2R/1R) net |
+|---|---:|---:|---:|
+| 0.5% of price (typical intraday) | 0.21R | **−0.08R — loses** | **+0.14R — survives** |
+| 1.0% of price (wide) | 0.10R | +0.02R — marginal, inside the noise | +0.25R — survives |
+
+So the illustration is **not a target** — at a realistic intraday stop it loses
+money, and even with a wide stop the edge is inside the cost estimate's error
+bars. The viable bar is the Section-12 profile: **avg winner/loser > 2, profit
+factor > 1.4, expectancy positive out-of-sample after costs.**
+
+This is enforced, not just documented:
+- `cost_model.net_expectancy(...)` gives gross vs net expectancy in R.
+- `intraday_calculator.net_trade_check(...)` re-checks R:R **after costs** (a
+  gross 1:2 can fail the net gate).
+- The backtest charges every simulated trade real costs and reports NET.
+
+Always evaluate on expectancy net of costs — never on win rate, never pre-cost.
+
+## Backtesting (what's available today)
+
+`scripts/backtest_intraday.py` runs a real, cost-aware, look-ahead-safe
+backtest of the ORB setup on 5-minute data:
+
+```bash
+python3 scripts/backtest_intraday.py                       # offline self-test
+python3 scripts/backtest_intraday.py --tickers RELIANCE,TCS,INFY --period 60d
+python3 scripts/backtest_intraday.py --source csv --csv-dir ./data --tickers RELIANCE
+```
+
+- Decision on a bar's **close**, fill on the **next bar's open** (no look-ahead).
+- Structural stop (opening-range low), 2R target, square-off at session end.
+- Every trade charged real costs + slippage; results reported **gross and net**.
+- Reads yfinance (~60 days free) **or** a CSV, so archived multi-year 5-minute
+  data drops straight in when you have it.
+
+**This is a smoke test, not validation.** Two months of one setup on today's
+tickers cannot prove an edge. For walk-forward, out-of-sample, robustness and
+survivorship handling, drive validation through the `backtest-expert` skill.
 
 ## Output: daily signal dashboard
 
@@ -159,5 +195,7 @@ tradeable). Template: `assets/daily_signal_dashboard_template.md`.
 - `references/scoring_model.md` — the five factors in full, with examples
 - `references/setups.md` — ORB and VWAP-continuation entry/stop/target rules
 - `references/risk_and_costs.md` — risk model, stops, daily controls, cost reality
-- `scripts/intraday_calculator.py` — scoring gate, sizing, daily-risk checks
+- `scripts/cost_model.py` — Indian intraday cost model + net expectancy
+- `scripts/intraday_calculator.py` — scoring gate, sizing, net R:R, daily-risk
+- `scripts/backtest_intraday.py` — cost-aware ORB backtest (yfinance or CSV)
 - `assets/daily_signal_dashboard_template.md` — output template

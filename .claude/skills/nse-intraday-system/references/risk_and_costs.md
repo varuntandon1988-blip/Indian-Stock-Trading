@@ -75,19 +75,25 @@ strategy.** Every evaluation must subtract *all* of:
 - Bid/ask spread paid
 - Slippage vs intended price
 
-**Round-trip friction on a liquid large-cap is roughly 0.08–0.15% of
-turnover.** Compare that to the plan's illustrative gross edge:
+This is computed exactly in `scripts/cost_model.py` (edit its rates for your
+broker). A ₹1,000 stock, 500 shares (₹5,00,000 position): round-trip cost is
+**≈ ₹523 = 0.105% of position value** (brokerage ₹40 + STT ₹125 + exchange
+₹30 + stamp ₹15 + GST ₹13 + ~₹300 slippage). That drag turns into an
+R-multiple via `cost_in_R = cost_frac / stop_frac` — so **the tighter your
+stop, the more of your edge costs eat.**
 
-| Item | Value |
-|---|---|
-| Illustrative expectancy | +0.125R (win 50%, avg win 1.25R, avg loss 1R) |
-| At 0.5% risk | **+0.0625% gross per trade** |
-| Realistic round-trip cost + slippage | **~0.08–0.15% per trade** |
-| Net | **Negative** |
+The plan's illustrative gross edge is +0.125R (win 50%, avg win 1.25R, avg loss
+1R). Net of the cost drag above:
 
-**Conclusion:** the 1.25R-winner illustration, taken literally, loses money
-after costs. It is a teaching example of *how expectancy works*, not a target.
-The viable profile is the Section-12 bar:
+| Stop width | Cost in R | Illustration (50%/1.25R/1R) net | Section-12 target (45%/2R/1R) net |
+|---|---:|---:|---:|
+| **0.5% of price** (typical intraday) | 0.21R | **−0.08R → loses** | **+0.14R → survives** |
+| 1.0% of price (wide) | 0.10R | +0.02R → marginal (inside the noise) | +0.25R → survives |
+
+**Conclusion:** the 1.25R-winner illustration is **not a target** — at a
+realistic intraday stop it is a net loser, and even with a wide stop its edge
+is within the cost estimate's error bars. It teaches *how expectancy works*,
+nothing more. The viable profile is the Section-12 bar:
 
 | Metric | Minimum viable |
 |---|---:|
@@ -98,9 +104,9 @@ The viable profile is the Section-12 bar:
 | Max drawdown | < 10–12% |
 | Sharpe | > 1.5 |
 
-At avg winner/loser > 2 and ~45% win rate the gross edge is roughly +0.35R
-(~+0.175%/trade at 0.5% risk) — comfortably above friction, which is why *that*
-is the bar and the 0.125R figure is not.
+At avg winner/loser > 2 and ~45% win rate the net edge is comfortably positive
+at both stop widths (+0.14R to +0.25R) — which is why *that* is the bar and the
+0.125R figure is not. Reproduce all of this with `python3 cost_model.py`.
 
 ---
 
@@ -116,11 +122,16 @@ guaranteed.
 
 ## Validation is not optional
 
-Do not go live because a backtest made money. Route all validation through the
-`backtest-expert` skill: in-sample → validation → walk-forward → out-of-sample,
-with realistic costs, no look-ahead bias, and a survivorship-bias-free universe.
-Then paper trade 8–12 weeks (logging *every* signal, traded or not) before
-committing a fraction of intended capital.
+Do not go live because a backtest made money. Start with the **smoke test**:
+`scripts/backtest_intraday.py` runs the ORB setup cost-aware and look-ahead-safe
+on ~60 days of free 5-minute data (or a CSV) and reports net metrics — enough to
+sanity-check that the mechanics and costs behave, not enough to prove an edge.
+For real validation route through the `backtest-expert` skill: in-sample →
+validation → walk-forward → out-of-sample, with realistic costs, no look-ahead
+bias, and a survivorship-bias-free universe (feed the harness archived
+multi-year 5-minute data via `--source csv`). Then paper trade 8–12 weeks
+(logging *every* signal, traded or not) before committing a fraction of
+intended capital.
 
 **GO only if:** positive out-of-sample expectancy after costs; profit factor
 > 1.4; drawdown acceptable; no single stock/month explains most profits;

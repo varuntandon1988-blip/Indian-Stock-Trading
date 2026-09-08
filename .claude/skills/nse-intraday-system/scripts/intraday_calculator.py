@@ -16,9 +16,14 @@ Run `python3 intraday_calculator.py` for a self-test / demo.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
 from math import floor
 from typing import Literal
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cost_model import IntradayCostModel, net_expectancy  # noqa: E402
 
 # ---- Five-factor score model (weights sum to 100) -------------------------
 
@@ -111,6 +116,28 @@ def trade_gate(
     if take:
         reasons.append(f"passed all gates (score {score}, R:R {rr})")
     return TradeDecision(take=take, score=score, rr=rr, reasons=reasons)
+
+
+def net_trade_check(
+    entry: float,
+    stop: float,
+    target: float,
+    direction: Literal["long", "short"],
+    qty: int,
+    model: IntradayCostModel | None = None,
+    min_net_rr: float = MIN_RR,
+) -> dict:
+    """Cost-adjusted R:R gate (point 1).
+
+    The gross R:R gate can pass a trade whose edge is eaten by costs. This
+    recomputes R:R after transaction costs + slippage and re-applies the
+    minimum. Use it *after* sizing, once qty is known.
+    """
+    model = model or IntradayCostModel()
+    rr = model.net_reward_risk(entry, stop, target, direction, qty)
+    rr["passes_net_rr"] = rr["net_rr"] >= min_net_rr
+    rr["min_net_rr"] = min_net_rr
+    return rr
 
 
 def position_size(
@@ -214,6 +241,12 @@ def _selftest() -> None:
     assert dr["stop_trading"] is True, dr
     dr2 = daily_risk_check(1_000_000, [-5000, 8000], trades_taken=2)
     assert dr2["stop_trading"] is False, dr2
+
+    # Net (cost-adjusted) R:R is worse than gross, and a gross 1:2 that is
+    # actually thin can fail the net gate.
+    net = net_trade_check(1000, 990, 1020, "long", 500)  # gross 2.0
+    assert net["net_rr"] < net["gross_rr"], net
+    assert net["passes_net_rr"] is False, net            # 2.0 gross -> <2 net
 
     print("All self-tests passed.")
 
