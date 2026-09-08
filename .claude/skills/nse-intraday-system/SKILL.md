@@ -206,4 +206,5 @@ tradeable). Template: `assets/daily_signal_dashboard_template.md`.
 - `scripts/cost_model.py` — Indian intraday cost model + net expectancy
 - `scripts/intraday_calculator.py` — scoring gate, sizing, net R:R, daily-risk
 - `scripts/backtest_intraday.py` — cost-aware ORB backtest (yfinance or CSV)
+- `references/example_backtest_run.md` — a real-data smoke-test run + lessons
 - `assets/daily_signal_dashboard_template.md` — output template
