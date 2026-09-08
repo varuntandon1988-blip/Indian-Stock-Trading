@@ -101,6 +101,35 @@ no news feed, so ~85 is the ceiling).
 Reproduce: `backtest_intraday.py --source csv --csv-dir <dir> --tickers
 INFY,HDFCBANK,ICICIBANK --rank --min-score 60`.
 
+## Follow-up 2: can better exits rescue it? (exit-mode sweep)
+
+Swept the exit engine (`--exit`) at score gate 60, same real data.
+
+| Exit mode | Trades | Win% | Exp/trade | PF |
+|---|---:|---:|---:|---:|
+| fixed2r (baseline) | 243 | 43.2 | **−0.073R** | **0.79** |
+| t1p5 (1.5R) | 243 | 43.2 | −0.092R | 0.76 |
+| t1 (1R) | 243 | 45.7 | −0.091R | 0.75 |
+| partial_be (½ at 1R, rest to 2R) | 243 | 45.7 | −0.088R | 0.74 |
+| trail (BE after 1R, 1R trail) | 243 | 42.4 | −0.112R | 0.70 |
+
+**No exit mode beat the fixed-2R baseline; every one made it worse, none
+crossed zero.** Why:
+1. **Smaller targets raise win rate but lower expectancy** (t1: 46% wins yet
+   −0.091R). The few big 2R+ winners were paying for the losers; capping them
+   trades a fatter tail for a higher hit rate and loses on net. Classic
+   high-win-rate / negative-expectancy trap.
+2. **Trailing gets whipsawed** on 5-minute noise — the worst variant.
+3. **Gross P&L is ~flat, so exits can't help.** Exits only *redistribute* a
+   zero-edge gross stream between win rate and average win; they cannot create
+   directional edge, and the fixed cost drag remains. **You cannot fix a
+   no-edge entry with clever exits.**
+
+The problem is localised for good: not costs alone, not selection, not exits —
+the **entry signal itself** (naive ORB / VWAP on these large-caps) has no
+intraday directional edge. Tuning more knobs from here is overfitting, exactly
+what this skill and `backtest-expert` warn against.
+
 ## The takeaway
 
 The harness works and tells the truth: a naive intraday ORB/VWAP system on
