@@ -69,6 +69,22 @@ class Params:
     min_score: float = 0.0       # five-factor score gate (0 = take every signal)
     max_trades_day: int = 5      # cap across the whole universe per day
     daily_loss_cap_pct: float = 0.015   # stop taking new trades past -1.5%/day
+    # Exit engine (composable; defaults reproduce the fixed-2R behaviour):
+    target_R: float | None = 2.0     # hard take-profit in R (None = no fixed target)
+    partial_R: float | None = None   # scale out at this R ...
+    partial_frac: float = 0.5        # ... this fraction, then move stop to breakeven
+    be_after_R: float | None = None  # move stop to entry once this R is reached
+    trail: bool = False              # after be_after_R, trail a 1R-wide stop on close
+
+
+# Named exit presets used by the CLI (--exit) and the experiment sweep.
+EXIT_MODES = {
+    "fixed2r":    dict(target_R=2.0),
+    "t1":         dict(target_R=1.0),
+    "t1p5":       dict(target_R=1.5),
+    "partial_be": dict(target_R=2.0, partial_R=1.0, partial_frac=0.5),
+    "trail":      dict(target_R=None, be_after_R=1.0, trail=True),
+}
 
 
 # --------------------------------------------------------------------------
@@ -101,39 +117,74 @@ def prepare(df):
 # Strategy core (pure; unit-tested on synthetic data)
 # --------------------------------------------------------------------------
 
-def _simulate_long(bars, entry, stop, target, p, cost: IntradayCostModel):
-    """Walk bars from the entry bar onward; return the exit and P&L."""
-    qty = position_size(p.capital, entry, stop, p.risk_pct,
+def _simulate_long(bars, entry, stop0, p, cost: IntradayCostModel):
+    """Walk bars from the entry bar onward, applying the configured exit engine.
+
+    Composable exits (all in R-multiples of the initial risk = entry - stop0):
+      - target_R:   hard take-profit (None = none).
+      - partial_R:  scale out `partial_frac` here, then move the stop to break-even.
+      - be_after_R: move the stop to entry once this R is reached.
+      - trail:      after be_after_R, trail a 1R-wide stop on the bar close.
+    Within a bar the order is stop -> partial -> breakeven -> trail -> target ->
+    square-off, and a bar spanning both stop and target is assumed to hit the
+    stop first (conservative). Costs are charged per executed leg.
+    """
+    qty = position_size(p.capital, entry, stop0, p.risk_pct,
                         p.max_position_pct)["shares"]
     if qty <= 0:
         return None
-    risk_per_share = entry - stop
-    exit_price, reason = None, None
+    risk = entry - stop0
+    stop, remaining = stop0, qty
+    gross, fees, legs, last_px = 0.0, 0.0, [], entry
+    partial_done = p.partial_R is None
+
+    def book(px, q, reason):
+        nonlocal gross, fees, last_px
+        gross += q * (px - entry)
+        fees += cost.trade_costs(entry, px, q)["total"]
+        legs.append(reason)
+        last_px = px
+
     for ts, bar in bars.iterrows():
-        # Conservative: if a bar spans both stop and target, assume stop first.
-        if bar["Low"] <= stop:
-            exit_price, reason = stop, "stop"
+        if bar["Low"] <= stop:                       # stop (or trailed / BE stop)
+            reason = ("stop" if stop == stop0
+                      else "be_stop" if abs(stop - entry) < 1e-9 else "trail_stop")
+            book(stop, remaining, reason)
+            remaining = 0
             break
-        if bar["High"] >= target:
-            exit_price, reason = target, "target"
+        if not partial_done and bar["High"] >= entry + p.partial_R * risk:
+            q1 = int(remaining * p.partial_frac)
+            if q1 > 0:
+                book(entry + p.partial_R * risk, q1, "partial")
+                remaining -= q1
+            partial_done = True
+            stop = max(stop, entry)                   # protect the runner at breakeven
+        if p.be_after_R is not None and stop < entry and bar["High"] >= entry + p.be_after_R * risk:
+            stop = entry
+        if p.trail and bar["High"] >= entry + (p.be_after_R or 1.0) * risk:
+            stop = max(stop, bar["Close"] - risk)     # 1R-wide trail on the close
+        if p.target_R is not None and bar["High"] >= entry + p.target_R * risk:
+            book(entry + p.target_R * risk, remaining, "target")
+            remaining = 0
             break
         if bar["t"] >= p.squareoff:
-            exit_price, reason = bar["Close"], "squareoff"
+            book(bar["Close"], remaining, "squareoff")
+            remaining = 0
             break
-    if exit_price is None:
-        exit_price, reason = bars.iloc[-1]["Close"], "eod"
+    if remaining > 0:
+        book(bars.iloc[-1]["Close"], remaining, "eod")
 
-    gross = qty * (exit_price - entry)
-    fees = cost.trade_costs(entry, exit_price, qty)["total"]
     net = gross - fees
+    reason = legs[0] if len(set(legs)) == 1 else "+".join(dict.fromkeys(legs))
     return {
-        "qty": qty, "entry": round(entry, 2), "exit": round(exit_price, 2),
-        "stop": round(stop, 2), "target": round(target, 2), "reason": reason,
-        "risk_per_share": round(risk_per_share, 4),
+        "qty": qty, "entry": round(entry, 2), "exit": round(last_px, 2),
+        "stop": round(stop0, 2), "reason": reason,
+        "risk_per_share": round(risk, 4),
         "gross_pnl": round(gross, 2), "fees": round(fees, 2),
         "net_pnl": round(net, 2),
-        "gross_R": round(gross / (qty * risk_per_share), 3),
-        "net_R": round(net / (qty * risk_per_share), 3),
+        "gross_R": round(gross / (qty * risk), 3),
+        "net_R": round(net / (qty * risk), 3),
+        "legs": legs,
     }
 
 
@@ -296,7 +347,7 @@ def simulate_candidate(sdf, cand: Candidate, p, cost: IntradayCostModel):
     after = sdf[sdf.index > cand.trigger_ts]
     if after.empty:
         return None
-    trade = _simulate_long(after, cand.entry, cand.stop, cand.target, p, cost)
+    trade = _simulate_long(after, cand.entry, cand.stop, p, cost)
     if trade:
         trade["setup"] = cand.setup
         trade["date"] = cand.date
@@ -597,6 +648,16 @@ def _selftest():
                                    Params(setup="vwap", min_score=99.0), cost)
     assert high_gate == [], "score gate 99 should reject the candidate"
 
+    # --- exit engine: same winning VWAP day under different exit modes ---
+    # vday: entry 101.9, risk 0.9 -> 1R@102.8, 2R@103.7; the 09:55 bar high 103.9.
+    t_fixed = backtest(vday, vnifty, Params(setup="vwap", **EXIT_MODES["fixed2r"]), cost)
+    assert t_fixed[0]["reason"] == "target" and 1.8 < t_fixed[0]["gross_R"] <= 2.0
+    t_1r = backtest(vday, vnifty, Params(setup="vwap", **EXIT_MODES["t1"]), cost)
+    assert t_1r[0]["reason"] == "target" and 0.95 <= t_1r[0]["gross_R"] <= 1.05, t_1r[0]
+    t_pb = backtest(vday, vnifty, Params(setup="vwap", **EXIT_MODES["partial_be"]), cost)
+    # half booked at 1R, remainder at 2R -> blended ~1.5R gross; both legs present.
+    assert "partial" in t_pb[0]["reason"] and 1.4 <= t_pb[0]["gross_R"] <= 1.6, t_pb[0]
+
     print("backtest self-tests passed.")
     return trades, m
 
@@ -612,6 +673,8 @@ def main():
     ap.add_argument("--csv-dir", default=".")
     ap.add_argument("--period", default="60d", help="yfinance period (max ~60d for 5m)")
     ap.add_argument("--setup", choices=["orb", "vwap", "both"], default="both")
+    ap.add_argument("--exit", choices=list(EXIT_MODES), default="fixed2r",
+                    help="exit engine: fixed2r | t1 | t1p5 | partial_be | trail")
     ap.add_argument("--rank", action="store_true",
                     help="score-ranked portfolio selection with daily controls")
     ap.add_argument("--min-score", type=float, default=0.0,
@@ -629,7 +692,8 @@ def main():
         return
 
     p = Params(capital=args.capital, risk_pct=args.risk, setup=args.setup,
-               min_score=args.min_score, max_trades_day=args.max_trades_day)
+               min_score=args.min_score, max_trades_day=args.max_trades_day,
+               **EXIT_MODES[args.exit])
     cost = IntradayCostModel()
 
     if args.source == "yfinance":
@@ -660,7 +724,7 @@ def main():
             print(f"[{tk}] {len(trades)} trade(s)")
         mode = "per-stock (no ranking)"
 
-    print(f"\n=== Aggregate (NET of costs) — setup: {args.setup} | {mode} ===")
+    print(f"\n=== Aggregate (NET of costs) — setup: {args.setup} | exit: {args.exit} | {mode} ===")
     m = metrics(all_trades, args.capital)
     for k, v in m.items():
         print(f"  {k:20s}: {v}")
