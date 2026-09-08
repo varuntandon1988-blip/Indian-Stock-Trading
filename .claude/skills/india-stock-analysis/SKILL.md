@@ -21,7 +21,6 @@ Use whichever broker MCP is connected. Both provide equivalent data for stock an
 - `fetch_market_movers_and_trending_stocks_funds` -- Market movers, gainers, losers
 - `fetch_fundamentals_screener` -- Screen stocks by fundamental criteria
 - `fetch_technical_screener` -- Screen stocks by technical signals
-- `search_stock_and_others_symbol` -- Search for stocks, indices, and companies
 - `resolve_market_time_and_calendar` -- Current market time, trading days, holidays
 
 ### Option B: Zerodha Kite MCP (if connected)
@@ -51,7 +50,7 @@ Use when the user asks for a quick overview, current price, or summary of a stoc
 
 **Steps:**
 
-1. **Resolve the symbol.** Call `curate_symbols` or `search_stock_and_others_symbol` with the company name to obtain the correct trading symbol and exchange (NSE/BSE).
+1. **Resolve the symbol.** Call `curate_symbols` with the company name to obtain the correct trading symbol and exchange (NSE/BSE).
 
 2. **Fetch current price.** Call `get_ltp` with the resolved trading symbol to get the last traded price, day change, and percentage change.
 
