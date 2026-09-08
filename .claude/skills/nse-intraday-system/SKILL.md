@@ -212,6 +212,28 @@ every signal and its outcome, and place **no orders** — Phase 4 of the plan
 (8–12 weeks, record every signal including those not taken). Never wire this to
 order execution while the backtest is a NO-GO.
 
+### Running it in chat, on demand (primary mode)
+
+When the Groww MCP (`GrowwMCP`, https://mcp.groww.in/mcp) is connected, run the
+loop conversationally — the user asks, Claude produces the dashboard. GrowwMCP
+exposes **no order tool** (only quotes/candles/indicators/holdings), so this is
+structurally paper-only. Steps Claude takes:
+
+1. `resolve_market_time_and_calendar` — confirm it's a trading day.
+2. For each universe name (CASH) and Nifty 50 (INDEX), call
+   `fetch_historical_candle_data` (interval 5, `last_n_days` 1), and save each
+   result JSON to `scripts/live/data/raw/<TICKER>.json` (index as `NIFTY.json`).
+3. `python3 scripts/live/mcp_to_csv.py --raw-dir scripts/live/data/raw
+   --out-dir scripts/live/data` → writes the CSVs.
+4. `python3 scripts/paper_trade.py scan|reconcile --source csv --csv-dir
+   scripts/live/data --tickers <...> --min-score 60 --log scripts/live/paper_log.csv`
+5. Show the dashboard / paper summary. Never call an order tool.
+
+This keeps the Python engine as the deterministic source of truth while the
+operation happens in chat — no cron, no local install needed.
+
+### Scripted paper loop (optional automation)
+
 `scripts/paper_trade.py` runs the paper loop (reusing the same detection,
 scoring and exit engine, so results are comparable to the backtest):
 
@@ -248,5 +270,6 @@ Schedule `scan` a few times during the session and `reconcile` after 15:30 IST
 - `scripts/intraday_calculator.py` — scoring gate, sizing, net R:R, daily-risk
 - `scripts/backtest_intraday.py` — cost-aware ORB+VWAP backtest, scoring, exits
 - `scripts/paper_trade.py` — live paper-trading signal generator + log (no orders)
+- `scripts/live/mcp_to_csv.py` — GrowwMCP candle JSON → paper CSVs (chat-driven mode)
 - `references/example_backtest_run.md` — real-data runs (backtest + sweeps) + lessons
 - `assets/daily_signal_dashboard_template.md` — output template
