@@ -203,6 +203,42 @@ survivorship handling, drive validation through the `backtest-expert` skill.
 Produce a ranked table of candidates (only score > 75 and R:R ≥ 1:2 are
 tradeable). Template: `assets/daily_signal_dashboard_template.md`.
 
+## Going live — paper trading only (NO orders)
+
+On the evidence gathered so far this system is a **NO-GO for real capital**
+(gross-flat, negative net expectancy at every tested configuration). The only
+responsible "live" step is **paper trading**: generate the live dashboard, log
+every signal and its outcome, and place **no orders** — Phase 4 of the plan
+(8–12 weeks, record every signal including those not taken). Never wire this to
+order execution while the backtest is a NO-GO.
+
+`scripts/paper_trade.py` runs the paper loop (reusing the same detection,
+scoring and exit engine, so results are comparable to the backtest):
+
+```bash
+# During the session — score today's candidates and log them (no orders):
+python3 scripts/paper_trade.py scan --source csv --csv-dir ./data \
+    --tickers INFY,HDFCBANK,ICICIBANK --min-score 60 --log paper_log.csv
+# After the close — fill in each logged signal's outcome:
+python3 scripts/paper_trade.py reconcile --source csv --csv-dir ./data \
+    --tickers INFY,HDFCBANK,ICICIBANK --min-score 60 --log paper_log.csv
+```
+
+- **Data:** a 5-minute CSV per symbol (plus `NIFTY.csv`) or `--source yfinance`.
+- **Agent flow with a broker MCP:** when a Groww/Zerodha MCP is connected, the
+  agent (not the script) pulls the day's 5-minute candles for the universe +
+  NIFTY, writes them to the `--csv-dir` as `<TICKER>.csv` / `NIFTY.csv`, then
+  runs `scan` intraday and `reconcile` after close. No order tools are called.
+- **The log** (`paper_log.csv`) records *every* detected candidate — gate-passing
+  ("signal") and sub-gate ("watch") — so the record includes signals not taken.
+  `reconcile` fills exit reason, net R and net P&L; the run prints a running
+  paper summary (win rate, net expectancy, profit factor).
+- **Go/No-Go:** only a positive, cost-adjusted paper expectancy sustained over
+  8–12 weeks makes a case to revisit live capital. Until then, no real money.
+
+Schedule `scan` a few times during the session and `reconcile` after 15:30 IST
+(e.g. cron, or a Claude routine), and let the log accumulate.
+
 ## Reference files
 
 - `references/scoring_model.md` — the five factors in full, with examples
@@ -210,6 +246,7 @@ tradeable). Template: `assets/daily_signal_dashboard_template.md`.
 - `references/risk_and_costs.md` — risk model, stops, daily controls, cost reality
 - `scripts/cost_model.py` — Indian intraday cost model + net expectancy
 - `scripts/intraday_calculator.py` — scoring gate, sizing, net R:R, daily-risk
-- `scripts/backtest_intraday.py` — cost-aware ORB backtest (yfinance or CSV)
-- `references/example_backtest_run.md` — a real-data smoke-test run + lessons
+- `scripts/backtest_intraday.py` — cost-aware ORB+VWAP backtest, scoring, exits
+- `scripts/paper_trade.py` — live paper-trading signal generator + log (no orders)
+- `references/example_backtest_run.md` — real-data runs (backtest + sweeps) + lessons
 - `assets/daily_signal_dashboard_template.md` — output template
