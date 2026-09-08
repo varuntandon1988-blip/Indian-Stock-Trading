@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Intraday Opening-Range-Breakout backtest harness for NSE cash equities.
+Intraday backtest harness for NSE cash equities — ORB and VWAP-continuation.
 
 This is the "fix what is available" answer to the data problem. It will NOT
 give you a multi-year study (free 5-minute history is ~60 days and is
 survivorship-biased), but it *will* run a real, cost-aware, look-ahead-safe
-backtest of the ORB setup on whatever 5-minute data you can get — free
-yfinance (~60 days) or any 5-minute CSV exported from a broker/data vendor.
+backtest of both setups on whatever 5-minute data you can get — free yfinance
+(~60 days) or any 5-minute CSV exported from a broker/data vendor.
+
+Setups (choose with --setup orb|vwap|both):
+  - ORB: opening range = 09:15-09:30 IST; entry on a confirmed breakout;
+    structural stop = opening-range low.
+  - VWAP continuation: impulse above VWAP -> pullback toward VWAP on
+    contracting volume (holding above it) -> resumption on a volume
+    expansion; structural stop = pullback low; losing VWAP invalidates.
 
 What it does honestly:
-  - Opening range = 09:15-09:30 IST; entry only on a confirmed breakout.
   - Filters: price > session VWAP, bullish NIFTY regime, positive relative
     strength vs NIFTY, and a volume-expansion check.
   - No look-ahead: the decision is made on a bar's CLOSE, the fill is the
     NEXT bar's OPEN.
-  - Structural stop (opening-range low), 2R target, square-off at session end.
+  - 2R target, square-off at session end.
   - Every trade is charged real transaction costs + slippage (cost_model.py),
     so results are reported GROSS and NET.
 
@@ -57,6 +63,8 @@ class Params:
     capital: float = 1_000_000.0
     min_or_bars: int = 3
     max_position_pct: float | None = 0.40
+    setup: str = "both"          # "orb", "vwap", or "both"
+    impulse_pct: float = 0.004   # VWAP setup: min impulse move from open (0.4%)
 
 
 # --------------------------------------------------------------------------
@@ -125,8 +133,18 @@ def _simulate_long(bars, entry, stop, target, p, cost: IntradayCostModel):
     }
 
 
-def run_day(sdf, ndf, p, cost: IntradayCostModel):
-    """Evaluate one trading day for one stock. Returns a trade dict or None."""
+def _regime_rs_ok(ndf, nifty_open, stock_open, bar):
+    """Bullish NIFTY regime and positive relative strength at this bar."""
+    n_here = ndf[ndf.index <= bar.name]
+    if n_here.empty:
+        return False
+    nifty_ret = n_here.iloc[-1]["Close"] / nifty_open - 1
+    stock_ret = bar["Close"] / stock_open - 1
+    return nifty_ret > 0 and stock_ret > nifty_ret
+
+
+def run_day_orb(sdf, ndf, p, cost: IntradayCostModel):
+    """Opening Range Breakout for one stock-day. Returns a trade dict or None."""
     or_bars = sdf[(sdf["t"] >= p.or_start) & (sdf["t"] < p.or_end)]
     if len(or_bars) < p.min_or_bars:
         return None
@@ -150,13 +168,7 @@ def run_day(sdf, ndf, p, cost: IntradayCostModel):
                 and bar["Close"] > bar["vwap"]
                 and bar["Volume"] > p.vol_mult * avg_vol):
             continue
-        # Regime + relative strength at this timestamp.
-        n_here = ndf[ndf.index <= ts]
-        if n_here.empty:
-            continue
-        nifty_ret = n_here.iloc[-1]["Close"] / nifty_open - 1
-        stock_ret = bar["Close"] / stock_open - 1
-        if not (nifty_ret > 0 and stock_ret > nifty_ret):
+        if not _regime_rs_ok(ndf, nifty_open, stock_open, bar):
             continue
         # Fill on the NEXT bar's open (no look-ahead).
         after = sdf[sdf.index > ts]
@@ -169,10 +181,98 @@ def run_day(sdf, ndf, p, cost: IntradayCostModel):
         target = entry + p.rr * (entry - stop)
         trade = _simulate_long(after, entry, stop, target, p, cost)
         if trade:
+            trade["setup"] = "orb"
             trade["date"] = str(bar["date"])
             trade["trigger_time"] = str(bar["t"])
         return trade
     return None
+
+
+def run_day_vwap(sdf, ndf, p, cost: IntradayCostModel):
+    """VWAP continuation for one stock-day. Returns a trade dict or None.
+
+    State machine over the primary window: impulse above VWAP -> pullback toward
+    VWAP on contracting volume (holding above VWAP) -> resumption above the
+    pullback high on a volume expansion. Entry fills on the next bar's open;
+    the structural stop is the pullback low. Losing VWAP invalidates the setup.
+    """
+    stock_open = sdf.iloc[0]["Open"]
+    if ndf is None or ndf.empty:
+        return None
+    nifty_open = ndf.iloc[0]["Open"]
+
+    window = sdf[(sdf["t"] >= p.or_end) & (sdf["t"] < p.entry_cutoff)]
+    phase = "seek_impulse"
+    impulse_high = impulse_vol = resume_ref = pullback_low = None
+
+    for ts, bar in window.iterrows():
+        prior = sdf[sdf.index < ts]
+        if len(prior) < p.min_or_bars:
+            continue
+        avg_vol = prior["Volume"].mean()
+        if avg_vol <= 0:
+            continue
+        vwap = bar["vwap"]
+
+        if phase == "seek_impulse":
+            if (bar["Close"] > vwap and bar["Volume"] >= avg_vol
+                    and (bar["Close"] / stock_open - 1) >= p.impulse_pct):
+                impulse_high = bar["High"]
+                impulse_vol = bar["Volume"]
+                pullback_low = None                    # set from pullback bars
+                phase = "seek_pullback"
+            continue
+
+        if phase == "seek_pullback":
+            if bar["Low"] < vwap:                      # lost VWAP -> invalid
+                phase = "seek_impulse"
+                continue
+            pullback_low = (bar["Low"] if pullback_low is None
+                            else min(pullback_low, bar["Low"]))
+            # Contraction: eased off the impulse high on lighter volume.
+            if bar["Volume"] < impulse_vol and bar["Close"] < impulse_high:
+                resume_ref = bar["High"]
+                phase = "seek_resume"
+            continue
+
+        if phase == "seek_resume":
+            if bar["Low"] < vwap:                      # lost VWAP -> restart
+                phase = "seek_impulse"
+                continue
+            pullback_low = min(pullback_low, bar["Low"])
+            resumed = (bar["Close"] > resume_ref and bar["Close"] > vwap
+                       and bar["Volume"] > p.vol_mult * avg_vol)
+            if resumed and _regime_rs_ok(ndf, nifty_open, stock_open, bar):
+                after = sdf[sdf.index > ts]
+                if after.empty:
+                    break
+                entry = after.iloc[0]["Open"]
+                stop = pullback_low
+                if entry - stop <= 0:
+                    break
+                target = entry + p.rr * (entry - stop)
+                trade = _simulate_long(after, entry, stop, target, p, cost)
+                if trade:
+                    trade["setup"] = "vwap"
+                    trade["date"] = str(bar["date"])
+                    trade["trigger_time"] = str(bar["t"])
+                return trade
+    return None
+
+
+def run_day(sdf, ndf, p, cost: IntradayCostModel):
+    """Dispatch to the configured setup(s). In 'both' mode, take the earliest
+    trigger of the day (one trade per stock per day)."""
+    if p.setup == "orb":
+        return run_day_orb(sdf, ndf, p, cost)
+    if p.setup == "vwap":
+        return run_day_vwap(sdf, ndf, p, cost)
+    # both -> earliest trigger wins
+    candidates = [t for t in (run_day_orb(sdf, ndf, p, cost),
+                              run_day_vwap(sdf, ndf, p, cost)) if t]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda t: t["trigger_time"])
 
 
 def backtest(stock_df, nifty_df, p: Params, cost: IntradayCostModel | None = None):
@@ -318,12 +418,13 @@ def _selftest():
         ]),
     ])
 
-    p = Params()
+    p = Params(setup="orb")
     cost = IntradayCostModel()
     trades = backtest(stock, nifty, p, cost)
 
     assert len(trades) == 2, f"expected 2 trades, got {len(trades)}: {trades}"
     t1, t2 = trades
+    assert t1["setup"] == "orb" and t2["setup"] == "orb"
     assert t1["reason"] == "target", t1
     assert t2["reason"] == "stop", t2
     # Costs must make net worse than gross on both.
@@ -336,6 +437,50 @@ def _selftest():
     m = metrics(trades, p.capital)
     assert m["trades"] == 2 and m["win_rate"] == 50.0, m
     assert m["fees"] > 0 and m["net_pnl"] < m["gross_pnl"], m
+
+    # --- VWAP continuation: engineered win (impulse -> contraction -> resume) ---
+    vday = _synthetic_day("2026-02-02", [
+        (9, 15, 100.0, 100.4, 99.7, 100.1, 800),
+        (9, 20, 100.1, 100.5, 99.9, 100.2, 800),
+        (9, 25, 100.2, 100.5, 100.0, 100.3, 800),
+        (9, 30, 100.3, 101.6, 100.3, 101.5, 3000),   # impulse above VWAP
+        (9, 35, 101.5, 101.5, 101.0, 101.1, 1200),   # contraction (resume_ref 101.5)
+        (9, 40, 101.1, 101.3, 101.0, 101.05, 900),   # further contraction, holds VWAP
+        (9, 45, 101.05, 102.0, 101.2, 101.9, 3500),  # resumption on volume expansion
+        (9, 50, 101.9, 102.4, 101.7, 102.3, 2000),   # entry bar (fill open 101.9)
+        (9, 55, 102.3, 103.9, 102.2, 103.8, 2500),   # 2R target ~103.7 hit
+        (15, 15, 103.8, 103.9, 103.5, 103.6, 1000),
+    ])
+    vnifty = _synthetic_day("2026-02-02", [
+        (9, 15, 20000, 20010, 19990, 20005, 0), (9, 20, 20005, 20015, 20000, 20010, 0),
+        (9, 25, 20010, 20020, 20005, 20015, 0), (9, 30, 20015, 20030, 20010, 20025, 0),
+        (9, 35, 20025, 20035, 20020, 20030, 0), (9, 40, 20030, 20040, 20025, 20035, 0),
+        (9, 45, 20035, 20045, 20030, 20040, 0), (9, 50, 20040, 20050, 20035, 20045, 0),
+        (9, 55, 20045, 20055, 20040, 20050, 0), (15, 15, 20050, 20055, 20045, 20050, 0),
+    ])
+    vt = backtest(vday, vnifty, Params(setup="vwap"), cost)
+    assert len(vt) == 1 and vt[0]["setup"] == "vwap", vt
+    assert vt[0]["reason"] == "target" and vt[0]["trigger_time"] == "09:45:00", vt[0]
+    assert vt[0]["stop"] == 101.0, vt[0]          # pullback low, not impulse origin
+    assert vt[0]["net_R"] < vt[0]["gross_R"], vt[0]
+
+    # --- VWAP invalidation: pullback breaks below VWAP -> no trade ---
+    inval = _synthetic_day("2026-02-03", [
+        (9, 15, 100.0, 100.4, 99.7, 100.1, 800),
+        (9, 20, 100.1, 100.5, 99.9, 100.2, 800),
+        (9, 25, 100.2, 100.5, 100.0, 100.3, 800),
+        (9, 30, 100.3, 101.6, 100.3, 101.5, 3000),   # impulse
+        (9, 35, 101.5, 101.5, 100.0, 100.2, 1200),   # breaks below VWAP -> reset
+        (9, 40, 100.2, 100.4, 100.0, 100.1, 900),    # stays weak, no new impulse
+        (9, 45, 100.1, 100.3, 99.9, 100.0, 900),
+        (15, 15, 100.0, 100.1, 99.8, 99.9, 1000),
+    ])
+    assert backtest(inval, vnifty, Params(setup="vwap"), cost) == [], "should be no VWAP trade"
+
+    # --- both mode: earliest trigger of the day wins (ORB 09:30 < VWAP 09:45) ---
+    both = backtest(vday, vnifty, Params(setup="both"), cost)
+    assert len(both) == 1 and both[0]["setup"] == "orb", both
+    assert both[0]["trigger_time"] == "09:30:00", both[0]
 
     print("backtest self-tests passed.")
     return trades, m
@@ -351,6 +496,7 @@ def main():
     ap.add_argument("--source", choices=["yfinance", "csv"], default="yfinance")
     ap.add_argument("--csv-dir", default=".")
     ap.add_argument("--period", default="60d", help="yfinance period (max ~60d for 5m)")
+    ap.add_argument("--setup", choices=["orb", "vwap", "both"], default="both")
     ap.add_argument("--capital", type=float, default=1_000_000.0)
     ap.add_argument("--risk", type=float, default=0.005)
     ap.add_argument("--index-symbol", default="^NSEI", help="regime/RS index (Yahoo: ^NSEI)")
@@ -362,7 +508,7 @@ def main():
         print("Provide --tickers to run on real 5-minute data.")
         return
 
-    p = Params(capital=args.capital, risk_pct=args.risk)
+    p = Params(capital=args.capital, risk_pct=args.risk, setup=args.setup)
     cost = IntradayCostModel()
 
     if args.source == "yfinance":
@@ -384,10 +530,15 @@ def main():
         all_trades.extend(trades)
         print(f"[{tk}] {len(trades)} trade(s)")
 
-    print("\n=== Aggregate (NET of costs) ===")
+    print(f"\n=== Aggregate (NET of costs) — setup: {args.setup} ===")
     m = metrics(all_trades, args.capital)
     for k, v in m.items():
         print(f"  {k:20s}: {v}")
+    if all_trades:
+        by_setup = {}
+        for t in all_trades:
+            by_setup[t.get("setup", "?")] = by_setup.get(t.get("setup", "?"), 0) + 1
+        print(f"  {'trades_by_setup':20s}: {by_setup}")
     print("\nReminder: a ~60-day, single-setup backtest on today's tickers is a "
           "smoke test, not validation. Use the backtest-expert skill for the "
           "real thing (walk-forward, out-of-sample, robustness, survivorship).")

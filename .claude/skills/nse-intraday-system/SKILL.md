@@ -167,17 +167,25 @@ Always evaluate on expectancy net of costs — never on win rate, never pre-cost
 ## Backtesting (what's available today)
 
 `scripts/backtest_intraday.py` runs a real, cost-aware, look-ahead-safe
-backtest of the ORB setup on 5-minute data:
+backtest of **both setups** on 5-minute data:
 
 ```bash
 python3 scripts/backtest_intraday.py                       # offline self-test
 python3 scripts/backtest_intraday.py --tickers RELIANCE,TCS,INFY --period 60d
+python3 scripts/backtest_intraday.py --setup orb  --tickers RELIANCE   # ORB only
+python3 scripts/backtest_intraday.py --setup vwap --tickers RELIANCE   # VWAP only
 python3 scripts/backtest_intraday.py --source csv --csv-dir ./data --tickers RELIANCE
 ```
 
+- `--setup orb | vwap | both` (default `both` — one trade/stock/day, earliest
+  trigger wins).
+- **ORB:** breakout of the 09:15–09:30 range; structural stop = opening-range low.
+- **VWAP continuation:** impulse above VWAP → pullback toward VWAP on contracting
+  volume (holding above it) → resumption on a volume expansion; structural stop =
+  pullback low. Losing VWAP invalidates the setup.
 - Decision on a bar's **close**, fill on the **next bar's open** (no look-ahead).
-- Structural stop (opening-range low), 2R target, square-off at session end.
-- Every trade charged real costs + slippage; results reported **gross and net**.
+- 2R target, square-off at session end; every trade charged real costs +
+  slippage; results reported **gross and net**, broken down by setup.
 - Reads yfinance (~60 days free) **or** a CSV, so archived multi-year 5-minute
   data drops straight in when you have it.
 
